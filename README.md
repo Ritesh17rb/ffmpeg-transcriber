@@ -1,20 +1,20 @@
-# livetrans
+# ffmpeg-transcriber
 
 Records a call (mic + speaker) to disk and transcribes it live in the terminal using Gemini.
 
 ## Requirements
 
 - Linux with PulseAudio
-- [FFmpeg](https://ffmpeg.org/download.html) (`sudo apt install ffmpeg`)
-- [uv](https://docs.astral.sh/uv/getting-started/installation/)
-- A [Google AI Studio](https://aistudio.google.com/) API key
+- FFmpeg: `sudo apt install ffmpeg`
+- uv: `curl -LsSf https://astral.sh/uv/install.sh | sh`
+- A Google AI Studio API key — get one at [aistudio.google.com](https://aistudio.google.com/)
 
 ## Setup
 
-1. Clone the repo and enter it:
+1. Clone the repo:
    ```bash
-   git clone <repo-url>
-   cd livetrans
+   git clone https://github.com/Ritesh17rb/ffmpeg-transcriber
+   cd ffmpeg-transcriber
    ```
 
 2. Create a `.env` file:
@@ -22,25 +22,22 @@ Records a call (mic + speaker) to disk and transcribes it live in the terminal u
    GEMINI_API_KEY=your_api_key_here
    ```
 
-   Optional overrides (defaults work for most Linux setups):
-   ```bash
-   MIC_DEVICE=default
-   SPEAKER_DEVICE=alsa_output.pci-0000_00_1f.3.analog-stereo.monitor
-   ```
-
-3. Find your speaker monitor device name if the default doesn't work:
+3. Find your speaker monitor device name:
    ```bash
    pactl list short sources | grep monitor
    ```
-   Copy the name and set it as `SPEAKER_DEVICE` in `.env`.
+   If the name differs from the default, add it to `.env`:
+   ```bash
+   SPEAKER_DEVICE=your_monitor_device_name
+   ```
 
-## Usage
+## Run
 
 ```bash
 uv run transcribe.py
 ```
 
-- Press **Enter** to start (wear a headset to avoid echo)
+- Press **Enter** to start — wear a headset to avoid echo
 - Transcripts print live every ~5 seconds
 - Recording saves to `~/Documents/calls/record-YYYY-MM-DD-HH-MM-SS.opus`
 - Press **Ctrl+C** to stop
