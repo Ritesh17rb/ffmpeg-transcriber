@@ -1,38 +1,53 @@
-# Realtime Audio Transcription
+# livetrans
 
-Run Anand's recorder in one terminal and this in another:
+Records a call (mic + speaker) to disk and transcribes it live in the terminal using Gemini.
+
+## Requirements
+
+- Linux with PulseAudio
+- [FFmpeg](https://ffmpeg.org/download.html) (`sudo apt install ffmpeg`)
+- [uv](https://docs.astral.sh/uv/getting-started/installation/)
+- A [Google AI Studio](https://aistudio.google.com/) API key
+
+## Setup
+
+1. Clone the repo and enter it:
+   ```bash
+   git clone <repo-url>
+   cd livetrans
+   ```
+
+2. Create a `.env` file:
+   ```bash
+   GEMINI_API_KEY=your_api_key_here
+   ```
+
+   Optional overrides (defaults work for most Linux setups):
+   ```bash
+   MIC_DEVICE=default
+   SPEAKER_DEVICE=alsa_output.pci-0000_00_1f.3.analog-stereo.monitor
+   ```
+
+3. Find your speaker monitor device name if the default doesn't work:
+   ```bash
+   pactl list short sources | grep monitor
+   ```
+   Copy the name and set it as `SPEAKER_DEVICE` in `.env`.
+
+## Usage
 
 ```bash
-npm install
-npm start
+uv run transcribe.py
 ```
 
-Or with explicit overrides:
+- Press **Enter** to start (wear a headset to avoid echo)
+- Transcripts print live every ~5 seconds
+- Recording saves to `~/Documents/calls/record-YYYY-MM-DD-HH-MM-SS.opus`
+- Press **Ctrl+C** to stop
 
-```bash
-node transcribe.js --mic default --speaker alsa_output.pci-0000_00_1f.3.analog-stereo.monitor
-```
+## How it works
 
-### Required `.env` key
+A single FFmpeg process captures mic and speaker monitor simultaneously and produces two outputs:
 
-```bash
-GEMINI_API_KEY=<your Google AI Studio key>
-```
-
-### Optional `.env` overrides
-
-```bash
-GEMINI_MODEL=models/gemini-2.0-flash-exp
-MIC_DEVICE=default
-SPEAKER_DEVICE=alsa_output.pci-0000_00_1f.3.analog-stereo.monitor
-TRANSCRIPTION_LANGUAGE=en
-```
-
-### Output format
-
-```
-[14:32:01] Okay wait, I am just thinking if I should...
-[14:32:04] Yeah, I have worked with this but I can explore.
-```
-
-Partial updates scroll in-place on the same line; finalized lines are printed with a timestamp.
+- **Archival**: mixed stereo Opus file saved to `~/Documents/calls/`
+- **Transcription**: raw PCM piped to the program → sent to Gemini every 5 seconds → printed to terminal
