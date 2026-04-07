@@ -57,7 +57,7 @@ uv run transcribe -i ~/Documents/calls/live-test.opus
 
 ## Run Without Cloning
 
-After the repo is published, the intended install-free flow is:
+Run directly from GitHub:
 
 ```bash
 uvx --from git+https://github.com/Ritesh17rb/ffmpeg-transcriber transcribe -i ~/Documents/calls/live-test.opus
