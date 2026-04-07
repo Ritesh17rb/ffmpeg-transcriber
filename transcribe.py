@@ -1,162 +1,320 @@
+import argparse
 import base64
 import json
 import os
-import signal
-import struct
+import shutil
 import subprocess
 import sys
-import threading
+import time
+import urllib.error
 import urllib.request
-from datetime import datetime
 from pathlib import Path
 
-# ── Config ────────────────────────────────────────────────────────────────────
 
-def load_env():
+def load_env() -> None:
     env = Path.cwd() / ".env"
     if not env.exists():
         return
-    for line in env.read_text().splitlines():
-        line = line.strip()
+    for raw_line in env.read_text().splitlines():
+        line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
-        key, _, val = line.partition("=")
+        key, _, value = line.partition("=")
         key = key.strip()
-        val = val.strip().strip('"').strip("'")
+        value = value.strip().strip('"').strip("'")
         if key and key not in os.environ:
-            os.environ[key] = val
+            os.environ[key] = value
+
 
 load_env()
 
-API_KEY  = os.environ.get("GEMINI_API_KEY", "")
-MIC      = os.environ.get("MIC_DEVICE", "default")
-SPEAKER  = os.environ.get("SPEAKER_DEVICE", "alsa_output.pci-0000_00_1f.3.analog-stereo.monitor")
-CALLS_DIR = Path.home() / "Documents" / "calls"
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+DEFAULT_CHUNK_SECONDS = float(os.environ.get("CHUNK_SECONDS", "5"))
+DEFAULT_LAG_SECONDS = float(os.environ.get("LAG_SECONDS", "5"))
+DEFAULT_POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "1"))
+DEFAULT_EXIT_WHEN_STABLE = float(os.environ.get("EXIT_WHEN_STABLE", "15"))
 
-SAMPLE_RATE = 16000
-CHUNK_MS    = 5000
-CHUNK_BYTES = SAMPLE_RATE * 2 * CHUNK_MS // 1000  # s16le mono
 
-GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={API_KEY}"
-
-# ── WAV ───────────────────────────────────────────────────────────────────────
-
-def to_wav(pcm: bytes) -> bytes:
-    n = len(pcm)
-    header = struct.pack(
-        "<4sI4s4sIHHIIHH4sI",
-        b"RIFF", 36 + n, b"WAVE",
-        b"fmt ", 16, 1, 1,
-        SAMPLE_RATE, SAMPLE_RATE * 2, 2, 16,
-        b"data", n,
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Follow a growing .opus file and print Gemini transcripts in near real time."
     )
-    return header + pcm
-
-# ── Gemini ────────────────────────────────────────────────────────────────────
-
-def transcribe(pcm: bytes, ts: str):
-    body = json.dumps({
-        "contents": [{"parts": [
-            {"inlineData": {"mimeType": "audio/wav", "data": base64.b64encode(to_wav(pcm)).decode()}},
-            {"text": "Transcribe the speech exactly as spoken. Output only the spoken words. If silence, output nothing."},
-        ]}],
-        "generationConfig": {"temperature": 0},
-    }).encode()
-
-    req = urllib.request.Request(
-        GEMINI_URL,
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+    parser.add_argument(
+        "-i",
+        "--input",
+        required=True,
+        help="Path to the .opus file being written by ffmpeg.",
     )
-    for attempt in range(2):
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read())
-                text = (
-                    data.get("candidates", [{}])[0]
-                        .get("content", {})
-                        .get("parts", [{}])[0]
-                        .get("text", "")
-                        .strip()
-                )
-                if text and any(c.isalpha() for c in text):
-                    print(f"[{ts}] {text}", flush=True)
-                return
-        except Exception as e:
-            if attempt == 1:
-                print(f"API error: {e}", file=sys.stderr, flush=True)
+    parser.add_argument(
+        "--chunk-seconds",
+        type=float,
+        default=DEFAULT_CHUNK_SECONDS,
+        help="Chunk size sent for transcription. Default: 5 seconds.",
+    )
+    parser.add_argument(
+        "--lag-seconds",
+        type=float,
+        default=DEFAULT_LAG_SECONDS,
+        help="How far behind the writer to stay while following the file. Default: 5 seconds.",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=DEFAULT_POLL_INTERVAL,
+        help="How often to poll the input file for growth. Default: 1 second.",
+    )
+    parser.add_argument(
+        "--exit-when-stable",
+        type=float,
+        default=DEFAULT_EXIT_WHEN_STABLE,
+        help=(
+            "Exit after the file stops growing for this many seconds. "
+            "Set to 0 to follow forever."
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"Gemini model to call. Default: {DEFAULT_MODEL}.",
+    )
+    return parser.parse_args()
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 
-def main():
-    if not API_KEY:
+def require_binary(name: str) -> None:
+    if shutil.which(name):
+        return
+    sys.exit(f"Missing required binary: {name}")
+
+
+def gemini_url(model: str) -> str:
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
         sys.exit("Missing GEMINI_API_KEY in .env")
+    base = os.environ.get("GEMINI_API_BASE", "https://generativelanguage.googleapis.com").rstrip("/")
+    return f"{base}/v1beta/models/{model}:generateContent?key={api_key}"
 
-    input("Use HEADSET to avoid echo. ENTER starts, Ctrl+C cancels: ")
 
-    CALLS_DIR.mkdir(parents=True, exist_ok=True)
-    out = CALLS_DIR / f"record-{datetime.now().strftime('%Y-%m-%d-%H-%M-%S')}.opus"
+def probe_duration(path: Path) -> float | None:
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
 
-    print(f"\nRecording → {out}")
-    print("Transcribing live… (Ctrl+C to stop)\n")
+    output = result.stdout.strip()
+    if not output or output == "N/A":
+        return None
 
-    # Single FFmpeg process: two outputs
-    #   [rec] → archival Opus file (Anand's format)
-    #   [pcm] → raw PCM pipe for transcription
-    ffmpeg = subprocess.Popen(
+    try:
+        duration = float(output)
+    except ValueError:
+        return None
+
+    return max(duration, 0.0)
+
+
+def extract_wav_chunk(path: Path, start: float, duration: float) -> bytes | None:
+    if duration <= 0:
+        return None
+
+    result = subprocess.run(
         [
             "ffmpeg",
-            "-hide_banner", "-loglevel", "error",
-            "-f", "pulse", "-i", MIC,
-            "-f", "pulse", "-i", SPEAKER,
-            "-filter_complex",
-                "[0:a]highpass=f=100,lowpass=f=12000,afftdn=nf=-30,volume=2[m];"
-                "[1:a]pan=mono|c0=FR[s];"
-                "[m]asplit=2[m1][m2];"
-                "[s]asplit=2[s1][s2];"
-                "[m1][s1]amerge,loudnorm=I=-16:LRA=7:tp=-1[rec];"
-                "[m2][s2]amix=inputs=2:weights=1 1:normalize=0,"
-                "aresample=16000,aformat=sample_fmts=s16:channel_layouts=mono,asetpts=N/SR/TB[pcm]",
-            # Output 1: archival recording
-            "-map", "[rec]", "-ar", "48000", "-ac", "2",
-            "-c:a", "libopus", "-b:a", "24k", str(out),
-            # Output 2: raw PCM for transcription
-            "-map", "[pcm]", "-f", "s16le", "-acodec", "pcm_s16le",
-            "-ac", "1", "-ar", "16000", "pipe:1",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{start:.3f}",
+            "-t",
+            f"{duration:.3f}",
+            "-i",
+            str(path),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-f",
+            "wav",
+            "pipe:1",
         ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0 or len(result.stdout) <= 44:
+        return None
+    return result.stdout
+
+
+def parse_gemini_text(payload: dict) -> str:
+    for candidate in payload.get("candidates", []):
+        content = candidate.get("content", {})
+        texts = [part.get("text", "") for part in content.get("parts", []) if part.get("text")]
+        merged = "".join(texts).strip()
+        if merged:
+            return merged
+    return ""
+
+
+def transcribe_chunk(wav_bytes: bytes, url: str) -> str:
+    prompt = (
+        "Transcribe the spoken audio exactly as heard. "
+        "Return only the transcript text. If there is no speech, return an empty response."
+    )
+    body = json.dumps(
+        {
+            "contents": [
+                {
+                    "parts": [
+                        {
+                            "inlineData": {
+                                "mimeType": "audio/wav",
+                                "data": base64.b64encode(wav_bytes).decode("ascii"),
+                            }
+                        },
+                        {"text": prompt},
+                    ]
+                }
+            ],
+            "generationConfig": {"temperature": 0},
+        }
+    ).encode("utf-8")
+
+    for attempt in range(3):
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+                return parse_gemini_text(payload)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            if attempt == 2:
+                print(f"Gemini API error ({exc.code}): {detail}", file=sys.stderr, flush=True)
+        except Exception as exc:  # pragma: no cover - network/runtime guard
+            if attempt == 2:
+                print(f"Gemini API error: {exc}", file=sys.stderr, flush=True)
+        time.sleep(min(2**attempt, 5))
+
+    return ""
+
+
+def format_offset(seconds: float) -> str:
+    whole_seconds = max(int(seconds), 0)
+    hours, remainder = divmod(whole_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def format_span(start: float, end: float) -> str:
+    return f"{format_offset(start)}-{format_offset(end)}"
+
+
+def process_chunk(path: Path, start: float, duration: float, url: str) -> bool:
+    wav_chunk = extract_wav_chunk(path, start, duration)
+    if wav_chunk is None:
+        return False
+
+    text = transcribe_chunk(wav_chunk, url).strip()
+    if text:
+        print(f"[{format_span(start, start + duration)}] {text}", flush=True)
+    return True
+
+
+def main() -> int:
+    args = parse_args()
+    if args.chunk_seconds <= 0:
+        sys.exit("--chunk-seconds must be greater than 0")
+    if args.lag_seconds < 0:
+        sys.exit("--lag-seconds must be 0 or greater")
+    if args.poll_interval <= 0:
+        sys.exit("--poll-interval must be greater than 0")
+    if args.exit_when_stable < 0:
+        sys.exit("--exit-when-stable must be 0 or greater")
+
+    require_binary("ffmpeg")
+    require_binary("ffprobe")
+
+    input_path = Path(args.input).expanduser()
+    url = gemini_url(args.model)
+
+    print(f"Following: {input_path}", flush=True)
+    print(
+        f"chunk={args.chunk_seconds:g}s lag={args.lag_seconds:g}s poll={args.poll_interval:g}s",
+        flush=True,
     )
 
-    threading.Thread(
-        target=lambda: [
-            print(f"[ffmpeg] {line.decode().strip()}", file=sys.stderr)
-            for line in ffmpeg.stderr if line.strip()
-        ],
-        daemon=True,
-    ).start()
+    next_start = 0.0
+    max_duration = 0.0
+    last_size: int | None = None
+    last_change_at = time.monotonic()
+    waiting_for_file = False
 
-    def handle_signal(*_):
-        ffmpeg.terminate()
-        print(f"\nSaved → {out}")
-        sys.exit(0)
+    while True:
+        if not input_path.exists():
+            if not waiting_for_file:
+                print(f"Waiting for file: {input_path}", flush=True)
+                waiting_for_file = True
+            time.sleep(args.poll_interval)
+            continue
 
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+        waiting_for_file = False
 
-    buf = b""
-    while chunk := ffmpeg.stdout.read(4096):
-        buf += chunk
-        while len(buf) >= CHUNK_BYTES:
-            ts = datetime.now().strftime("%H:%M:%S")
-            threading.Thread(target=transcribe, args=(buf[:CHUNK_BYTES], ts), daemon=True).start()
-            buf = buf[CHUNK_BYTES:]
+        try:
+            size = input_path.stat().st_size
+        except FileNotFoundError:
+            time.sleep(args.poll_interval)
+            continue
 
-    if ffmpeg.returncode not in (0, -signal.SIGTERM, None):
-        sys.exit(f"ffmpeg exited (code={ffmpeg.returncode})")
+        if last_size is None or size != last_size:
+            last_size = size
+            last_change_at = time.monotonic()
+
+        duration = probe_duration(input_path)
+        if duration is not None:
+            max_duration = max(max_duration, duration)
+
+        stable = args.exit_when_stable > 0 and (time.monotonic() - last_change_at) >= args.exit_when_stable
+        ready_until = max_duration if stable else max(0.0, max_duration - args.lag_seconds)
+
+        processed_any = False
+        while (next_start + args.chunk_seconds) <= (ready_until + 1e-6):
+            if not process_chunk(input_path, next_start, args.chunk_seconds, url):
+                break
+            next_start += args.chunk_seconds
+            processed_any = True
+
+        if stable:
+            remaining = max_duration - next_start
+            if remaining > 0.25:
+                process_chunk(input_path, next_start, remaining, url)
+            print("Input stopped growing; exiting.", flush=True)
+            return 0
+
+        if not processed_any:
+            time.sleep(args.poll_interval)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\nStopped.", flush=True)
+        raise SystemExit(130)

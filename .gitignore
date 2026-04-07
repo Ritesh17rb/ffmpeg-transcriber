@@ -1,6 +1,7 @@
 .env
 transcript.md
 plan.md
+.codex
 .venv/
 __pycache__/
 *.pyc
