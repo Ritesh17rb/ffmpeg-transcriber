@@ -91,7 +91,7 @@ uv run transcribe -i ~/Documents/calls/call.opus
 3. Every 5s of audio is chunked, sent to Gemini in parallel (4 workers), and printed in order.
 4. Silence is filtered out — only speech lines are printed and saved.
 5. Transcripts are saved to `~/Documents/transcripts/<name>_<date>.txt`.
-6. The transcriber stays open, polling for new audio — it never exits until you `Ctrl+C`.
+6. When the recording stops (Ctrl+C in Terminal 1), the transcriber **auto-exits after 10 seconds**.
 7. If you restart, it resumes from where it left off.
 
 ---
@@ -109,7 +109,7 @@ transcribe -i <file> [options]
 | `--no-save` | off | Print to terminal only, don't save files |
 | `--chunk-seconds` | `5` | Audio chunk size per API call |
 | `--from-start` | off | Transcribe from the beginning instead of live position |
-| `--exit-after` | `0` | Exit after file stops growing for N seconds (0 = never) |
+| `--exit-after` | `10` | Exit after file stops growing for N seconds (0 = never) |
 | `--model` | `gemini-2.5-flash` | Gemini model to use |
 
 ## Environment Variables

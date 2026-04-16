@@ -16,6 +16,7 @@ from pathlib import Path
 LAG_SECONDS = 2
 POLL_INTERVAL = 1
 WORKERS = 4
+STABLE_EXIT_SECONDS = 10
 SILENCE = {"silence", "no speech", "no spoken words", "no audio", "inaudible", ""}
 
 
@@ -45,7 +46,7 @@ def parse_args():
     p.add_argument("--no-save", action="store_true", help="Print only; don't save to disk.")
     p.add_argument("--chunk-seconds", type=float, default=float(os.environ.get("CHUNK_SECONDS", "5")), help="Seconds per chunk (default: 5).")
     p.add_argument("--from-start", action="store_true", help="Transcribe from the beginning instead of jumping to live position.")
-    p.add_argument("--exit-after", type=float, default=0, help="Exit after file stops growing for N seconds (0 = never).")
+    p.add_argument("--exit-after", type=float, default=STABLE_EXIT_SECONDS, help=f"Exit after file stops growing for N seconds (default: {STABLE_EXIT_SECONDS}). Set to 0 to never exit.")
     p.add_argument("--model", default=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"), help="Gemini model (default: gemini-2.5-flash).")
     return p.parse_args()
 
