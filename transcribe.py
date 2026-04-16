@@ -8,308 +8,288 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 
+LAG_SECONDS = 2
+POLL_INTERVAL = 1
+WORKERS = 4
+SILENCE = {"silence", "no speech", "no spoken words", "no audio", "inaudible", ""}
 
-def load_env() -> None:
+
+def load_env():
     env = Path.cwd() / ".env"
     if not env.exists():
         return
-    for raw_line in env.read_text().splitlines():
-        line = raw_line.strip()
+    for line in env.read_text().splitlines():
+        line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
+        k, _, v = line.partition("=")
+        k, v = k.strip(), v.strip().strip('"').strip("'")
+        if k and k not in os.environ:
+            os.environ[k] = v
 
 
 load_env()
 
-DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-DEFAULT_CHUNK_SECONDS = float(os.environ.get("CHUNK_SECONDS", "5"))
-DEFAULT_LAG_SECONDS = float(os.environ.get("LAG_SECONDS", "5"))
-DEFAULT_POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "1"))
-DEFAULT_EXIT_WHEN_STABLE = float(os.environ.get("EXIT_WHEN_STABLE", "15"))
+
+def parse_args():
+    p = argparse.ArgumentParser(
+        description="Follow a growing .opus file and print real-time Gemini transcripts."
+    )
+    p.add_argument("-i", "--input", required=True, help="Path to the .opus file being written by ffmpeg.")
+    p.add_argument("-o", "--output-dir", default=os.environ.get("TRANSCRIPT_DIR", str(Path.home() / "Documents" / "transcripts")), help="Directory for saved transcripts.")
+    p.add_argument("--no-save", action="store_true", help="Print only; don't save to disk.")
+    p.add_argument("--chunk-seconds", type=float, default=float(os.environ.get("CHUNK_SECONDS", "5")), help="Seconds per chunk (default: 5).")
+    p.add_argument("--from-start", action="store_true", help="Transcribe from the beginning instead of jumping to live position.")
+    p.add_argument("--exit-after", type=float, default=0, help="Exit after file stops growing for N seconds (0 = never).")
+    p.add_argument("--model", default=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"), help="Gemini model (default: gemini-2.5-flash).")
+    return p.parse_args()
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Follow a growing .opus file and print Gemini transcripts in near real time."
-    )
-    parser.add_argument(
-        "-i",
-        "--input",
-        required=True,
-        help="Path to the .opus file being written by ffmpeg.",
-    )
-    parser.add_argument(
-        "--chunk-seconds",
-        type=float,
-        default=DEFAULT_CHUNK_SECONDS,
-        help="Chunk size sent for transcription. Default: 5 seconds.",
-    )
-    parser.add_argument(
-        "--lag-seconds",
-        type=float,
-        default=DEFAULT_LAG_SECONDS,
-        help="How far behind the writer to stay while following the file. Default: 5 seconds.",
-    )
-    parser.add_argument(
-        "--poll-interval",
-        type=float,
-        default=DEFAULT_POLL_INTERVAL,
-        help="How often to poll the input file for growth. Default: 1 second.",
-    )
-    parser.add_argument(
-        "--exit-when-stable",
-        type=float,
-        default=DEFAULT_EXIT_WHEN_STABLE,
-        help=(
-            "Exit after the file stops growing for this many seconds. "
-            "Set to 0 to follow forever."
-        ),
-    )
-    parser.add_argument(
-        "--model",
-        default=DEFAULT_MODEL,
-        help=f"Gemini model to call. Default: {DEFAULT_MODEL}.",
-    )
-    return parser.parse_args()
+def require(name):
+    if not shutil.which(name):
+        sys.exit(f"Missing required binary: {name}")
 
 
-def require_binary(name: str) -> None:
-    if shutil.which(name):
-        return
-    sys.exit(f"Missing required binary: {name}")
-
-
-def gemini_url(model: str) -> str:
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        sys.exit("Missing GEMINI_API_KEY in .env")
+def api_url(model):
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not key:
+        sys.exit("Set GEMINI_API_KEY in your environment or .env file")
     base = os.environ.get("GEMINI_API_BASE", "https://generativelanguage.googleapis.com").rstrip("/")
-    return f"{base}/v1beta/models/{model}:generateContent?key={api_key}"
+    return f"{base}/v1beta/models/{model}:generateContent?key={key}"
 
 
-def probe_duration(path: Path) -> float | None:
-    result = subprocess.run(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(path),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
+def probe_duration(path):
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+        capture_output=True, text=True, check=False,
     )
-    if result.returncode != 0:
-        return None
-
-    output = result.stdout.strip()
-    if not output or output == "N/A":
-        return None
-
     try:
-        duration = float(output)
-    except ValueError:
+        d = float(r.stdout.strip())
+        return max(d, 0.0)
+    except (ValueError, AttributeError):
         return None
 
-    return max(duration, 0.0)
 
-
-def extract_wav_chunk(path: Path, start: float, duration: float) -> bytes | None:
-    if duration <= 0:
-        return None
-
-    result = subprocess.run(
-        [
-            "ffmpeg",
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-ss",
-            f"{start:.3f}",
-            "-t",
-            f"{duration:.3f}",
-            "-i",
-            str(path),
-            "-vn",
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-f",
-            "wav",
-            "pipe:1",
-        ],
-        capture_output=True,
-        check=False,
+def extract_wav(path, start, duration):
+    r = subprocess.run(
+        ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+         "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(path),
+         "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", "pipe:1"],
+        capture_output=True, check=False,
     )
-    if result.returncode != 0 or len(result.stdout) <= 44:
-        return None
-    return result.stdout
+    return r.stdout if r.returncode == 0 and len(r.stdout) > 44 else None
 
 
-def parse_gemini_text(payload: dict) -> str:
-    for candidate in payload.get("candidates", []):
-        content = candidate.get("content", {})
-        texts = [part.get("text", "") for part in content.get("parts", []) if part.get("text")]
-        merged = "".join(texts).strip()
-        if merged:
-            return merged
-    return ""
-
-
-def transcribe_chunk(wav_bytes: bytes, url: str) -> str:
+def transcribe(wav_bytes, url):
     prompt = (
-        "Transcribe the spoken audio exactly as heard. "
-        "Return only the transcript text. If there is no speech, return an empty response."
+        "Transcribe ALL spoken words exactly as heard. Include filler words and partial words. "
+        "Return ONLY the transcript. If no speech, return exactly: [silence]"
     )
-    body = json.dumps(
-        {
-            "contents": [
-                {
-                    "parts": [
-                        {
-                            "inlineData": {
-                                "mimeType": "audio/wav",
-                                "data": base64.b64encode(wav_bytes).decode("ascii"),
-                            }
-                        },
-                        {"text": prompt},
-                    ]
-                }
-            ],
-            "generationConfig": {"temperature": 0},
-        }
-    ).encode("utf-8")
+    body = json.dumps({
+        "contents": [{"parts": [
+            {"inlineData": {"mimeType": "audio/wav", "data": base64.b64encode(wav_bytes).decode()}},
+            {"text": prompt},
+        ]}],
+        "generationConfig": {"temperature": 0},
+    }).encode()
 
     for attempt in range(3):
-        request = urllib.request.Request(
-            url,
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+        req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-                return parse_gemini_text(payload)
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+                for c in data.get("candidates", []):
+                    texts = [p.get("text", "") for p in c.get("content", {}).get("parts", []) if p.get("text")]
+                    result = "".join(texts).strip()
+                    if result:
+                        return result
+                return ""
+        except Exception as e:
             if attempt == 2:
-                print(f"Gemini API error ({exc.code}): {detail}", file=sys.stderr, flush=True)
-        except Exception as exc:  # pragma: no cover - network/runtime guard
-            if attempt == 2:
-                print(f"Gemini API error: {exc}", file=sys.stderr, flush=True)
-        time.sleep(min(2**attempt, 5))
-
+                print(f"API error: {e}", file=sys.stderr, flush=True)
+            time.sleep(min(2 ** attempt, 5))
     return ""
 
 
-def format_offset(seconds: float) -> str:
-    whole_seconds = max(int(seconds), 0)
-    hours, remainder = divmod(whole_seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+def is_silence(text):
+    if not text:
+        return True
+    cleaned = text.lower().strip("[]() .\n")
+    return cleaned in SILENCE or cleaned.startswith("no spoken")
 
 
-def format_span(start: float, end: float) -> str:
-    return f"{format_offset(start)}-{format_offset(end)}"
+def fmt(seconds):
+    s = max(int(seconds), 0)
+    return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
 
 
-def process_chunk(path: Path, start: float, duration: float, url: str) -> bool:
-    wav_chunk = extract_wav_chunk(path, start, duration)
-    if wav_chunk is None:
+def span(start, end):
+    return f"{fmt(start)}-{fmt(end)}"
+
+
+def process_chunk(path, start, duration, url):
+    wav = extract_wav(path, start, duration)
+    if wav is None:
+        return (start, start + duration, "")
+    return (start, start + duration, transcribe(wav, url).strip())
+
+
+def file_is_growing(path, wait=2.0):
+    try:
+        s1 = path.stat().st_size
+    except FileNotFoundError:
+        return False
+    time.sleep(wait)
+    try:
+        return path.stat().st_size > s1
+    except FileNotFoundError:
         return False
 
-    text = transcribe_chunk(wav_chunk, url).strip()
-    if text:
-        print(f"[{format_span(start, start + duration)}] {text}", flush=True)
-    return True
 
-
-def main() -> int:
+def main():
     args = parse_args()
-    if args.chunk_seconds <= 0:
-        sys.exit("--chunk-seconds must be greater than 0")
-    if args.lag_seconds < 0:
-        sys.exit("--lag-seconds must be 0 or greater")
-    if args.poll_interval <= 0:
-        sys.exit("--poll-interval must be greater than 0")
-    if args.exit_when_stable < 0:
-        sys.exit("--exit-when-stable must be 0 or greater")
-
-    require_binary("ffmpeg")
-    require_binary("ffprobe")
+    require("ffmpeg")
+    require("ffprobe")
 
     input_path = Path(args.input).expanduser()
-    url = gemini_url(args.model)
+    url = api_url(args.model)
+    output_dir = Path(args.output_dir).expanduser()
 
-    print(f"Following: {input_path}", flush=True)
-    print(
-        f"chunk={args.chunk_seconds:g}s lag={args.lag_seconds:g}s poll={args.poll_interval:g}s",
-        flush=True,
-    )
+    # Transcript file setup
+    transcript_file = None
+    state_path = None
+    if not args.no_save:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        stem = input_path.stem
+        transcript_file = output_dir / f"{stem}_{datetime.now().strftime('%Y%m%d')}.txt"
+        state_path = output_dir / f".{stem}.state.json"
+        if not transcript_file.exists():
+            transcript_file.write_text(f"# Transcript of {input_path.name}\n# Started: {datetime.now().isoformat()}\n\n")
+        print(f"Saving to: {transcript_file}", flush=True)
 
+    # Determine starting position
     next_start = 0.0
-    max_duration = 0.0
-    last_size: int | None = None
-    last_change_at = time.monotonic()
-    waiting_for_file = False
-
-    while True:
-        if not input_path.exists():
-            if not waiting_for_file:
-                print(f"Waiting for file: {input_path}", flush=True)
-                waiting_for_file = True
-            time.sleep(args.poll_interval)
-            continue
-
-        waiting_for_file = False
-
+    if not args.from_start and state_path and state_path.exists():
         try:
-            size = input_path.stat().st_size
-        except FileNotFoundError:
-            time.sleep(args.poll_interval)
-            continue
+            next_start = float(json.loads(state_path.read_text()).get("next_start", 0))
+            if next_start > 0:
+                print(f"Resuming from {fmt(next_start)}", flush=True)
+        except (json.JSONDecodeError, ValueError):
+            next_start = 0.0
 
-        if last_size is None or size != last_size:
-            last_size = size
-            last_change_at = time.monotonic()
+    # Wait for file and detect live position
+    if not args.from_start and next_start == 0.0:
+        while not input_path.exists():
+            print(f"Waiting for: {input_path}", flush=True)
+            time.sleep(POLL_INTERVAL)
+        growing = file_is_growing(input_path)
+        dur = probe_duration(input_path)
+        if dur and dur > args.chunk_seconds and growing:
+            next_start = max(0.0, dur - LAG_SECONDS)
+            print(f"Live: jumping to {fmt(next_start)} ({dur:.0f}s file)", flush=True)
 
-        duration = probe_duration(input_path)
-        if duration is not None:
-            max_duration = max(max_duration, duration)
+    print(f"Following: {input_path} | chunk={args.chunk_seconds:g}s", flush=True)
 
-        stable = args.exit_when_stable > 0 and (time.monotonic() - last_change_at) >= args.exit_when_stable
-        ready_until = max_duration if stable else max(0.0, max_duration - args.lag_seconds)
+    max_dur = 0.0
+    last_size = None
+    last_change = time.monotonic()
+    in_flight: deque[tuple[float, float, Future]] = deque()
 
-        processed_any = False
-        while (next_start + args.chunk_seconds) <= (ready_until + 1e-6):
-            if not process_chunk(input_path, next_start, args.chunk_seconds, url):
+    def drain():
+        while in_flight:
+            s, e, fut = in_flight[0]
+            if not fut.done():
                 break
-            next_start += args.chunk_seconds
-            processed_any = True
+            in_flight.popleft()
+            try:
+                _, _, text = fut.result()
+            except Exception:
+                continue
+            if not is_silence(text):
+                line = f"[{span(s, e)}] {text}"
+                print(line, flush=True)
+                if transcript_file:
+                    with open(transcript_file, "a") as f:
+                        f.write(line + "\n")
+            if state_path:
+                state_path.write_text(json.dumps({"next_start": e}))
 
-        if stable:
-            remaining = max_duration - next_start
-            if remaining > 0.25:
-                process_chunk(input_path, next_start, remaining, url)
-            print("Input stopped growing; exiting.", flush=True)
-            return 0
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        while True:
+            if not input_path.exists():
+                drain()
+                time.sleep(POLL_INTERVAL)
+                continue
 
-        if not processed_any:
-            time.sleep(args.poll_interval)
+            try:
+                size = input_path.stat().st_size
+            except FileNotFoundError:
+                drain()
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            if last_size is None or size != last_size:
+                last_size = size
+                last_change = time.monotonic()
+
+            dur = probe_duration(input_path)
+            if dur is not None:
+                max_dur = max(max_dur, dur)
+
+            stable = args.exit_after > 0 and (time.monotonic() - last_change) >= args.exit_after
+            ready = max_dur if stable else max(0.0, max_dur - LAG_SECONDS)
+
+            # Dispatch chunks
+            dispatched = False
+            while next_start + args.chunk_seconds <= ready + 1e-6 and len(in_flight) < WORKERS * 2:
+                fut = pool.submit(process_chunk, input_path, next_start, args.chunk_seconds, url)
+                in_flight.append((next_start, next_start + args.chunk_seconds, fut))
+                next_start += args.chunk_seconds
+                dispatched = True
+
+            # Partial chunk for lower latency
+            if not dispatched and not stable and not in_flight:
+                partial = ready - next_start
+                if partial >= 2.0:
+                    fut = pool.submit(process_chunk, input_path, next_start, partial, url)
+                    in_flight.append((next_start, next_start + partial, fut))
+                    next_start += partial
+                    dispatched = True
+
+            drain()
+
+            if stable:
+                for s, e, fut in in_flight:
+                    try:
+                        _, _, text = fut.result(timeout=60)
+                        if not is_silence(text):
+                            line = f"[{span(s, e)}] {text}"
+                            print(line, flush=True)
+                            if transcript_file:
+                                with open(transcript_file, "a") as f:
+                                    f.write(line + "\n")
+                    except Exception:
+                        pass
+                in_flight.clear()
+                remaining = max_dur - next_start
+                if remaining > 0.25:
+                    _, _, text = process_chunk(input_path, next_start, remaining, url)
+                    if not is_silence(text):
+                        line = f"[{span(next_start, next_start + remaining)}] {text}"
+                        print(line, flush=True)
+                        if transcript_file:
+                            with open(transcript_file, "a") as f:
+                                f.write(line + "\n")
+                print("Done — file stopped growing.", flush=True)
+                return 0
+
+            time.sleep(POLL_INTERVAL if not dispatched and not in_flight else 0.2)
 
 
 if __name__ == "__main__":
