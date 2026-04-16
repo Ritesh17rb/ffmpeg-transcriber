@@ -1,4 +1,4 @@
-# ffmpeg-transcriber
+# livetrans
 
 Real-time transcription of a growing `.opus` recording using the Gemini API.
 
@@ -17,6 +17,8 @@ One terminal records, another transcribes — text appears within seconds of spe
 
 ## Quick Start
 
+Open two terminals side by side.
+
 ### Terminal 1 — Record
 
 ```bash
@@ -28,13 +30,23 @@ ffmpeg -hide_banner -stats -v error \
   ~/Documents/calls/call.opus
 ```
 
+This starts recording your microphone to an `.opus` file. Press `Ctrl+C` to stop.
+
 <details>
 <summary>Record microphone + system audio (both sides of a call)</summary>
+
+First, find your speaker monitor source:
+
+```bash
+pactl list short sources | grep monitor
+```
+
+Then use it as the second input:
 
 ```bash
 ffmpeg -hide_banner -stats -v error \
   -f pulse -i default \
-  -f pulse -i $(pactl list short sources | grep monitor | head -1 | cut -f2) \
+  -f pulse -i <your-monitor-source-name> \
   -filter_complex "\
     [0:a]highpass=f=100,lowpass=f=12000,afftdn=nf=-30,volume=2[m]; \
     [1:a]pan=mono|c0=FR[s]; \
@@ -47,57 +59,62 @@ ffmpeg -hide_banner -stats -v error \
 
 ### Terminal 2 — Transcribe
 
+No cloning needed — run directly with `uvx`:
+
 ```bash
-GEMINI_API_KEY=your_key uvx --from git+https://github.com/Ritesh17rb/ffmpeg-transcriber transcribe -i ~/Documents/calls/call.opus
+GEMINI_API_KEY=your_key \
+  uvx --from git+https://github.com/Ritesh17rb/ffmpeg-transcriber \
+  transcribe -i ~/Documents/calls/call.opus
 ```
 
-Or locally:
+The transcriber will detect the growing file, jump to the live position, and start printing transcriptions as you speak.
+
+---
+
+## Local Development
 
 ```bash
+git clone https://github.com/Ritesh17rb/ffmpeg-transcriber
+cd ffmpeg-transcriber
+
 echo 'GEMINI_API_KEY=your_key' > .env
+
 uv run transcribe -i ~/Documents/calls/call.opus
 ```
 
 ---
 
-## How It Works
+## What Happens
 
-```
-ffmpeg (Terminal 1)
-  writes growing .opus file
-
-transcribe (Terminal 2)
-  polls file size every 1s
-  probes duration with ffprobe
-  extracts 5s WAV chunks via ffmpeg
-  sends up to 4 chunks to Gemini in parallel
-  prints results in timestamp order
-  saves speech lines to transcript file
-```
-
-On startup, the transcriber detects if the file is actively growing and **jumps to the live position**. It **never exits** — keeps polling until you Ctrl+C. If you stop and restart, it **resumes from where it left off**.
-
-Transcripts are saved to `~/Documents/transcripts/<name>_<date>.txt`.
+1. **Terminal 1** — ffmpeg writes audio to a growing `.opus` file.
+2. **Terminal 2** — the transcriber detects the file is growing and jumps to the live position.
+3. Every 5s of audio is chunked, sent to Gemini in parallel (4 workers), and printed in order.
+4. Silence is filtered out — only speech lines are printed and saved.
+5. Transcripts are saved to `~/Documents/transcripts/<name>_<date>.txt`.
+6. The transcriber stays open, polling for new audio — it never exits until you `Ctrl+C`.
+7. If you restart, it resumes from where it left off.
 
 ---
 
 ## CLI Reference
 
 ```
-transcribe -i <file.opus> [options]
+transcribe -i <file> [options]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `-i`, `--input` | *(required)* | Path to the audio file being written |
 | `-o`, `--output-dir` | `~/Documents/transcripts` | Where to save transcripts |
-| `--no-save` | off | Print only, don't save files |
+| `--no-save` | off | Print to terminal only, don't save files |
 | `--chunk-seconds` | `5` | Audio chunk size per API call |
-| `--from-start` | off | Start from beginning instead of live position |
+| `--from-start` | off | Transcribe from the beginning instead of live position |
 | `--exit-after` | `0` | Exit after file stops growing for N seconds (0 = never) |
 | `--model` | `gemini-2.5-flash` | Gemini model to use |
 
 ## Environment Variables
+
+Set in `.env` or export in your shell:
 
 | Variable | Description |
 |---|---|
